@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     firestore_service_account_path: str = Field(
         default="service.json", alias="FIRESTORE_SERVICE_ACCOUNT_PATH"
     )
+    pokemon_tcg_api_base_url: str = Field(
+        default="https://api.pokemontcg.io/v2", alias="POKEMON_TCG_API_BASE_URL"
+    )
+    pokemon_tcg_api_key: str | None = Field(default=None, alias="POKEMON_TCG_API_KEY")
 
     @property
     def backend_root(self) -> Path:

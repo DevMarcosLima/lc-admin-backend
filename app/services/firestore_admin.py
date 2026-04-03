@@ -16,7 +16,12 @@ class FirestoreConnectionError(RuntimeError):
     pass
 
 
+class FirestoreQuotaExceeded(FirestoreConnectionError):
+    pass
+
+
 CATEGORY_SUBCOLLECTION = "items"
+MAX_ANALYTICS_DOCS = 2500
 
 PRODUCT_BUCKET_MAP: dict[str, str] = {
     "single_card": "cards",
@@ -40,6 +45,23 @@ def _resolve_service_account_path() -> Path:
     return settings.backend_root / configured
 
 
+def _map_firestore_error(exc: Exception, context: str) -> FirestoreConnectionError:
+    resource_exhausted_types: tuple[type[BaseException], ...] = ()
+    try:
+        from google.api_core.exceptions import ResourceExhausted
+
+        resource_exhausted_types = (ResourceExhausted,)
+    except ModuleNotFoundError:
+        resource_exhausted_types = ()
+
+    if resource_exhausted_types and isinstance(exc, resource_exhausted_types):
+        return FirestoreQuotaExceeded(
+            "Firestore quota exceeded (429). Aguarde alguns minutos ou ajuste a cota no GCP."
+        )
+
+    return FirestoreConnectionError(f"{context}: {exc}")
+
+
 @lru_cache(maxsize=1)
 def get_firestore_client() -> Any:
     settings = get_settings()
@@ -56,17 +78,27 @@ def get_firestore_client() -> Any:
     project_id = settings.firestore_project_id
 
     if service_account_path.exists():
-        credentials = service_account.Credentials.from_service_account_file(
-            str(service_account_path)
-        )
-        project_id = project_id or credentials.project_id
-        if not project_id:
-            raise FirestoreConnectionError("Unable to resolve project id from service account")
-        return firestore.Client(project=project_id, credentials=credentials)
+        try:
+            credentials = service_account.Credentials.from_service_account_file(
+                str(service_account_path)
+            )
+            project_id = project_id or credentials.project_id
+            if not project_id:
+                raise FirestoreConnectionError(
+                    "Unable to resolve project id from service account"
+                )
+            return firestore.Client(project=project_id, credentials=credentials)
+        except FirestoreConnectionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise _map_firestore_error(exc, "Failed to initialize Firestore client") from exc
 
-    if project_id:
-        return firestore.Client(project=project_id)
-    return firestore.Client()
+    try:
+        if project_id:
+            return firestore.Client(project=project_id)
+        return firestore.Client()
+    except Exception as exc:  # noqa: BLE001
+        raise _map_firestore_error(exc, "Failed to initialize Firestore client") from exc
 
 
 def _bucket_for_product(product: StoreProduct) -> str:
@@ -82,12 +114,15 @@ def _find_product_document(slug: str) -> tuple[str, Any, dict[str, Any]] | None:
     client = get_firestore_client()
     catalog_ref = client.collection(settings.firestore_collection_products)
 
-    for bucket in _all_bucket_ids():
-        doc_ref = catalog_ref.document(bucket).collection(CATEGORY_SUBCOLLECTION).document(slug)
-        snapshot = doc_ref.get()
-        if not snapshot.exists:
-            continue
-        return bucket, doc_ref, snapshot.to_dict() or {}
+    try:
+        for bucket in _all_bucket_ids():
+            doc_ref = catalog_ref.document(bucket).collection(CATEGORY_SUBCOLLECTION).document(slug)
+            snapshot = doc_ref.get()
+            if not snapshot.exists:
+                continue
+            return bucket, doc_ref, snapshot.to_dict() or {}
+    except Exception as exc:  # noqa: BLE001
+        raise _map_firestore_error(exc, "Failed to locate product in Firestore") from exc
 
     return None
 
@@ -100,18 +135,21 @@ def fetch_products_from_firestore() -> list[StoreProduct]:
     products: list[StoreProduct] = []
     seen: set[str] = set()
 
-    for category_doc in catalog_ref.stream():
-        for item_doc in category_doc.reference.collection(CATEGORY_SUBCOLLECTION).stream():
-            payload = item_doc.to_dict() or {}
-            payload.setdefault("slug", item_doc.id)
-            try:
-                product = StoreProduct.model_validate(payload)
-            except ValidationError:
-                continue
-            if product.slug in seen:
-                continue
-            seen.add(product.slug)
-            products.append(product)
+    try:
+        for category_doc in catalog_ref.stream():
+            for item_doc in category_doc.reference.collection(CATEGORY_SUBCOLLECTION).stream():
+                payload = item_doc.to_dict() or {}
+                payload.setdefault("slug", item_doc.id)
+                try:
+                    product = StoreProduct.model_validate(payload)
+                except ValidationError:
+                    continue
+                if product.slug in seen:
+                    continue
+                seen.add(product.slug)
+                products.append(product)
+    except Exception as exc:  # noqa: BLE001
+        raise _map_firestore_error(exc, "Failed to fetch products from Firestore") from exc
 
     return products
 
@@ -130,20 +168,23 @@ def upsert_product(product: StoreProduct) -> StoreProduct:
         _, _, existing_payload = existing
         created_at = str(existing_payload.get("created_at") or now_iso)
 
-    category_ref = catalog_ref.document(target_bucket)
-    category_ref.set({"id": target_bucket, "updated_at": now_iso}, merge=True)
+    try:
+        category_ref = catalog_ref.document(target_bucket)
+        category_ref.set({"id": target_bucket, "updated_at": now_iso}, merge=True)
 
-    doc_ref = category_ref.collection(CATEGORY_SUBCOLLECTION).document(product.slug)
-    payload = product.model_dump()
-    payload["bucket"] = target_bucket
-    payload["created_at"] = created_at
-    payload["updated_at"] = now_iso
-    doc_ref.set(payload, merge=True)
+        doc_ref = category_ref.collection(CATEGORY_SUBCOLLECTION).document(product.slug)
+        payload = product.model_dump()
+        payload["bucket"] = target_bucket
+        payload["created_at"] = created_at
+        payload["updated_at"] = now_iso
+        doc_ref.set(payload, merge=True)
 
-    if existing:
-        current_bucket, current_doc_ref, _ = existing
-        if current_bucket != target_bucket:
-            current_doc_ref.delete()
+        if existing:
+            current_bucket, current_doc_ref, _ = existing
+            if current_bucket != target_bucket:
+                current_doc_ref.delete()
+    except Exception as exc:  # noqa: BLE001
+        raise _map_firestore_error(exc, "Failed to upsert product in Firestore") from exc
 
     return product
 
@@ -152,8 +193,13 @@ def delete_product(slug: str) -> bool:
     existing = _find_product_document(slug)
     if not existing:
         return False
+
     _, doc_ref, _ = existing
-    doc_ref.delete()
+    try:
+        doc_ref.delete()
+    except Exception as exc:  # noqa: BLE001
+        raise _map_firestore_error(exc, "Failed to delete product from Firestore") from exc
+
     return True
 
 
@@ -161,21 +207,41 @@ def analytics_summary_last_days(days: int = 30) -> list[tuple[str, int]]:
     settings = get_settings()
     client = get_firestore_client()
     threshold = datetime.now(UTC) - timedelta(days=days)
+    threshold_date = threshold.date().isoformat()
 
     counts: Counter[str] = Counter()
-    docs = client.collection(settings.firestore_collection_analytics).stream()
-    for doc in docs:
-        payload = doc.to_dict() or {}
-        endpoint = str(payload.get("endpoint") or "unknown")
-        created_raw = str(payload.get("created_at") or "")
-        if not created_raw:
-            continue
-        try:
-            created_at = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if created_at < threshold:
-            continue
-        counts[endpoint] += 1
+
+    try:
+        query = client.collection(settings.firestore_collection_analytics).where(
+            "date_utc", ">=", threshold_date
+        )
+
+        for index, doc in enumerate(query.stream()):
+            if index >= MAX_ANALYTICS_DOCS:
+                break
+
+            payload = doc.to_dict() or {}
+            endpoint = str(payload.get("endpoint") or "unknown")
+            created_raw = str(payload.get("created_at") or "")
+            date_raw = str(payload.get("date_utc") or "")
+
+            created_at: datetime | None = None
+            if created_raw:
+                try:
+                    created_at = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+                except ValueError:
+                    created_at = None
+            elif date_raw:
+                try:
+                    created_at = datetime.fromisoformat(f"{date_raw}T00:00:00+00:00")
+                except ValueError:
+                    created_at = None
+
+            if not created_at or created_at < threshold:
+                continue
+
+            counts[endpoint] += 1
+    except Exception as exc:  # noqa: BLE001
+        raise _map_firestore_error(exc, "Failed to query analytics summary") from exc
 
     return sorted(counts.items(), key=lambda item: item[1], reverse=True)
