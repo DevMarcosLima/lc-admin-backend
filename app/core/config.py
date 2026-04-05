@@ -30,6 +30,17 @@ class Settings(BaseSettings):
         default="https://api.pokemontcg.io/v2", alias="POKEMON_TCG_API_BASE_URL"
     )
     pokemon_tcg_api_key: str | None = Field(default=None, alias="POKEMON_TCG_API_KEY")
+    awesomeapi_fx_url: str = Field(
+        default="https://economia.awesomeapi.com.br/json/last/USD-BRL,EUR-BRL",
+        alias="AWESOMEAPI_FX_URL",
+    )
+    awesomeapi_fx_key: str | None = Field(default=None, alias="AWESOMEAPI_FX_KEY")
+    awesomeapi_fx_timeout_seconds: float = Field(
+        default=8.0, alias="AWESOMEAPI_FX_TIMEOUT_SECONDS"
+    )
+    awesomeapi_fx_cache_seconds: int = Field(
+        default=900, alias="AWESOMEAPI_FX_CACHE_SECONDS"
+    )
 
     @property
     def backend_root(self) -> Path:

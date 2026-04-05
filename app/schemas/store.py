@@ -8,6 +8,7 @@ class StoreProduct(BaseModel):
     set_name: str | None = None
     set_series: str | None = None
     rarity: str | None = None
+    finish: str | None = None
     condition: str | None = None
     card_number: str | None = None
     regulation_mark: str | None = None
@@ -22,6 +23,7 @@ class StoreProduct(BaseModel):
     stock: int
     price_brl: float
     image_url: str
+    image_gallery: list[str] = Field(default_factory=list)
     is_special: bool = False
 
 
@@ -60,6 +62,12 @@ class CardLookupItem(BaseModel):
     rarity: str | None = None
     image_small: str | None = None
     image_large: str | None = None
+    suggested_price_usd: float | None = None
+    suggested_price_brl: float | None = None
+    suggested_price_currency: str | None = None
+    suggested_price_source: str | None = None
+    suggested_finish: str | None = None
+    usd_brl_rate: float | None = None
     pokemon_generation: str | None = None
 
 
@@ -74,6 +82,7 @@ class CardMetadataOptionsResponse(BaseModel):
     rarity_options: list[str]
     set_name_options: list[str]
     set_series_options: list[str]
+    finish_options: list[str]
     condition_options: list[str]
     year_options: list[int]
     generation_options: list[str]
