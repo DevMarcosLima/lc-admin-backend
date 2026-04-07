@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     awesomeapi_fx_cache_seconds: int = Field(
         default=900, alias="AWESOMEAPI_FX_CACHE_SECONDS"
     )
+    openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
+    openai_regulation_model: str = Field(
+        default="gpt-5-nano", alias="OPENAI_REGULATION_MODEL"
+    )
+    openai_regulation_batch_size: int = Field(
+        default=40, alias="OPENAI_REGULATION_BATCH_SIZE"
+    )
+    lot_import_max_cards: int = Field(default=500, alias="LOT_IMPORT_MAX_CARDS")
 
     @property
     def backend_root(self) -> Path:

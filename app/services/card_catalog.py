@@ -339,7 +339,9 @@ def search_cards(query: str, limit: int = 12) -> list[CardLookupItem]:
         return []
 
     safe_limit = max(1, min(limit, 50))
-    select_fields = "id,name,number,rarity,images,set,nationalPokedexNumbers,tcgplayer,cardmarket"
+    select_fields = (
+        "id,name,number,rarity,regulationMark,images,set,nationalPokedexNumbers,tcgplayer,cardmarket"
+    )
 
     cards_data: list[dict[str, Any]] = []
     for candidate in _query_candidates(query_text):
@@ -394,6 +396,7 @@ def search_cards(query: str, limit: int = 12) -> list[CardLookupItem]:
                 release_date=release_date,
                 release_year=release_year,
                 rarity=str(card_payload.get("rarity") or "").strip() or None,
+                regulation_mark=str(card_payload.get("regulationMark") or "").strip() or None,
                 image_small=str(images_payload.get("small") or "").strip() or None,
                 image_large=str(images_payload.get("large") or "").strip() or None,
                 suggested_price_usd=suggested_usd,

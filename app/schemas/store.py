@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -60,6 +62,7 @@ class CardLookupItem(BaseModel):
     release_date: str | None = None
     release_year: int | None = None
     rarity: str | None = None
+    regulation_mark: str | None = None
     image_small: str | None = None
     image_large: str | None = None
     suggested_price_usd: float | None = None
@@ -86,3 +89,57 @@ class CardMetadataOptionsResponse(BaseModel):
     condition_options: list[str]
     year_options: list[int]
     generation_options: list[str]
+
+
+class LotImportStartRequest(BaseModel):
+    lot_payload: dict[str, Any]
+    default_condition: str = "Near Mint (NM)"
+    default_finish: str = "Normal"
+    default_category: str = "Cartas avulsas"
+    infer_regulation_mark_with_openai: bool = True
+
+
+class LotImportStartResponse(BaseModel):
+    job_id: str
+    status: str
+    total_cards: int
+
+
+class LotImportEntryPreview(BaseModel):
+    index: int
+    status: str
+    action: str | None = None
+    message: str | None = None
+    slug: str
+    name: str
+    card_number: str
+    category: str
+    language: str
+    quantity: int
+    condition: str | None = None
+    finish: str | None = None
+    set_name: str | None = None
+    set_code: str | None = None
+    rarity: str | None = None
+    regulation_mark: str | None = None
+    release_year: int | None = None
+    pokemon_generation: str | None = None
+    image_url: str | None = None
+    price_brl: float = 0.0
+
+
+class LotImportJobResponse(BaseModel):
+    job_id: str
+    status: str
+    lot_id: str | None = None
+    lot_name: str | None = None
+    started_at: str
+    finished_at: str | None = None
+    total_cards: int
+    prepared_cards: int
+    processed_cards: int
+    created_count: int
+    updated_count: int
+    error_count: int
+    last_error: str | None = None
+    entries: list[LotImportEntryPreview]

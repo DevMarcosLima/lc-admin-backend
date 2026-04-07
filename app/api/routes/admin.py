@@ -5,6 +5,9 @@ from app.schemas.store import (
     AnalyticsSummaryResponse,
     CardLookupResponse,
     CardMetadataOptionsResponse,
+    LotImportJobResponse,
+    LotImportStartRequest,
+    LotImportStartResponse,
     StoreDeleteResponse,
     StoreProduct,
     StoreProductListResponse,
@@ -19,6 +22,12 @@ from app.services.firestore_admin import (
     delete_product,
     fetch_products_from_firestore,
     upsert_product,
+)
+from app.services.lot_import import (
+    LotImportError,
+    LotImportNotFound,
+    get_lot_import,
+    start_lot_import,
 )
 
 # TEST MODE (TEMPORARIO): auth desabilitada para facilitar testes locais.
@@ -90,6 +99,22 @@ def lookup_cards(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     return CardLookupResponse(source="pokemontcg.io", query=query, items=items)
+
+
+@router.post("/lots/import/start", response_model=LotImportStartResponse)
+def post_start_lot_import(payload: LotImportStartRequest) -> LotImportStartResponse:
+    try:
+        return start_lot_import(payload)
+    except LotImportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/lots/import/{job_id}", response_model=LotImportJobResponse)
+def get_lot_import_status(job_id: str) -> LotImportJobResponse:
+    try:
+        return get_lot_import(job_id)
+    except LotImportNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/analytics/summary", response_model=AnalyticsSummaryResponse)
