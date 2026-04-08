@@ -10,6 +10,12 @@ from pydantic import ValidationError
 
 from app.core.config import get_settings
 from app.schemas.store import StoreProduct
+from app.services.bigquery_admin import (
+    BigQueryConnectionError,
+)
+from app.services.bigquery_admin import (
+    analytics_summary_last_days as bigquery_analytics_summary_last_days,
+)
 
 
 class FirestoreConnectionError(RuntimeError):
@@ -76,6 +82,7 @@ def get_firestore_client() -> Any:
 
     service_account_path = _resolve_service_account_path()
     project_id = settings.firestore_project_id
+    database_id = settings.firestore_database_id or "(default)"
 
     if service_account_path.exists():
         try:
@@ -87,7 +94,11 @@ def get_firestore_client() -> Any:
                 raise FirestoreConnectionError(
                     "Unable to resolve project id from service account"
                 )
-            return firestore.Client(project=project_id, credentials=credentials)
+            return firestore.Client(
+                project=project_id,
+                credentials=credentials,
+                database=database_id,
+            )
         except FirestoreConnectionError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -95,8 +106,8 @@ def get_firestore_client() -> Any:
 
     try:
         if project_id:
-            return firestore.Client(project=project_id)
-        return firestore.Client()
+            return firestore.Client(project=project_id, database=database_id)
+        return firestore.Client(database=database_id)
     except Exception as exc:  # noqa: BLE001
         raise _map_firestore_error(exc, "Failed to initialize Firestore client") from exc
 
@@ -204,7 +215,21 @@ def delete_product(slug: str) -> bool:
 
 
 def analytics_summary_last_days(days: int = 30) -> list[tuple[str, int]]:
+    _, summary = analytics_summary_last_days_with_source(days=days)
+    return summary
+
+
+def analytics_summary_last_days_with_source(days: int = 30) -> tuple[str, list[tuple[str, int]]]:
     settings = get_settings()
+
+    if settings.bigquery_enabled:
+        try:
+            summary = bigquery_analytics_summary_last_days(days=days)
+            return "bigquery", summary
+        except BigQueryConnectionError as exc:
+            if not settings.analytics_summary_fallback_firestore:
+                raise FirestoreConnectionError(str(exc)) from exc
+
     client = get_firestore_client()
     threshold = datetime.now(UTC) - timedelta(days=days)
     threshold_date = threshold.date().isoformat()
@@ -244,4 +269,4 @@ def analytics_summary_last_days(days: int = 30) -> list[tuple[str, int]]:
     except Exception as exc:  # noqa: BLE001
         raise _map_firestore_error(exc, "Failed to query analytics summary") from exc
 
-    return sorted(counts.items(), key=lambda item: item[1], reverse=True)
+    return "firestore", sorted(counts.items(), key=lambda item: item[1], reverse=True)

@@ -7,6 +7,7 @@ class StoreProduct(BaseModel):
     slug: str
     name: str
     product_type: str
+    lot_id: str | None = None
     set_name: str | None = None
     set_series: str | None = None
     rarity: str | None = None
@@ -110,6 +111,7 @@ class LotImportEntryPreview(BaseModel):
     status: str
     action: str | None = None
     message: str | None = None
+    lot_id: str | None = None
     slug: str
     name: str
     card_number: str

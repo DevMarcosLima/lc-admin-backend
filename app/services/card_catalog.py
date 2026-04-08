@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import threading
+import time
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -79,6 +83,10 @@ class CardCatalogError(RuntimeError):
 
 _FX_CACHE: dict[str, float] | None = None
 _FX_CACHE_EXPIRES_AT: datetime | None = None
+_LOGGER = logging.getLogger(__name__)
+_POKEMON_TCG_REQUEST_LOCK = threading.Lock()
+_LAST_POKEMON_TCG_REQUEST_AT = 0.0
+_RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 
 _TCGPLAYER_PRICE_TYPE_PRIORITY = [
     "normal",
@@ -90,11 +98,63 @@ _TCGPLAYER_PRICE_TYPE_PRIORITY = [
 
 _TCGPLAYER_METRIC_PRIORITY = ["market", "mid", "low", "high", "directLow"]
 _CARDMARKET_METRIC_PRIORITY = ["suggestedPrice", "trendPrice", "averageSellPrice", "avg7", "avg30"]
+_NUMBER_TOTAL_PATTERN = re.compile(r"(\d{1,4})\s*/\s*(\d{1,4})")
 
 
 def _base_url(path: str) -> str:
     settings = get_settings()
     return f"{settings.pokemon_tcg_api_base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def _parse_retry_after_seconds(raw_value: str | None) -> float | None:
+    value = (raw_value or "").strip()
+    if not value:
+        return None
+
+    if value.isdigit():
+        return max(0.0, float(int(value)))
+
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=UTC)
+
+    now = datetime.now(UTC)
+    delta = (retry_at - now).total_seconds()
+    return max(0.0, delta)
+
+
+def _wait_for_pokemon_tcg_slot(min_interval_seconds: float) -> None:
+    global _LAST_POKEMON_TCG_REQUEST_AT
+
+    safe_interval = max(0.0, min_interval_seconds)
+    if safe_interval <= 0:
+        return
+
+    with _POKEMON_TCG_REQUEST_LOCK:
+        now = time.monotonic()
+        remaining = safe_interval - (now - _LAST_POKEMON_TCG_REQUEST_AT)
+        if remaining > 0:
+            time.sleep(remaining)
+            now = time.monotonic()
+        _LAST_POKEMON_TCG_REQUEST_AT = now
+
+
+def _backoff_delay(
+    *,
+    attempt: int,
+    base_delay_seconds: float,
+    max_delay_seconds: float,
+    retry_after_seconds: float | None,
+) -> float:
+    if retry_after_seconds is not None and retry_after_seconds > 0:
+        return min(max_delay_seconds, retry_after_seconds)
+
+    exponential = base_delay_seconds * (2 ** max(0, attempt - 1))
+    return min(max_delay_seconds, exponential)
 
 
 def _request_json(url: str) -> dict[str, Any]:
@@ -103,18 +163,79 @@ def _request_json(url: str) -> dict[str, Any]:
     if settings.pokemon_tcg_api_key:
         headers["X-Api-Key"] = settings.pokemon_tcg_api_key
 
+    timeout_seconds = max(1.0, float(settings.pokemon_tcg_timeout_seconds))
+    max_attempts = max(1, int(settings.pokemon_tcg_retry_attempts))
+    base_delay = max(0.05, float(settings.pokemon_tcg_retry_base_delay_seconds))
+    max_delay = max(base_delay, float(settings.pokemon_tcg_retry_max_delay_seconds))
+    min_interval = max(0.0, float(settings.pokemon_tcg_min_interval_seconds))
+
     request = Request(url=url, headers=headers)
-    try:
-        with urlopen(request, timeout=20) as response:
-            payload = response.read().decode("utf-8")
-    except HTTPError as exc:
-        raise CardCatalogError(f"Pokemon card API error ({exc.code})") from exc
-    except URLError as exc:
-        raise CardCatalogError("Pokemon card API indisponivel no momento") from exc
+    payload = ""
+
+    for attempt in range(1, max_attempts + 1):
+        _wait_for_pokemon_tcg_slot(min_interval)
+
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                payload = response.read().decode("utf-8")
+            break
+        except HTTPError as exc:
+            should_retry = (
+                attempt < max_attempts and exc.code in _RETRYABLE_HTTP_STATUS_CODES
+            )
+            retry_after = _parse_retry_after_seconds(
+                exc.headers.get("Retry-After") if exc.headers else None
+            )
+
+            _LOGGER.warning(
+                "Pokemon API HTTP %s em %s (tentativa %s/%s)%s",
+                exc.code,
+                url,
+                attempt,
+                max_attempts,
+                " - nova tentativa" if should_retry else "",
+            )
+
+            if not should_retry:
+                raise CardCatalogError(f"Pokemon card API error ({exc.code})") from exc
+
+            time.sleep(
+                _backoff_delay(
+                    attempt=attempt,
+                    base_delay_seconds=base_delay,
+                    max_delay_seconds=max_delay,
+                    retry_after_seconds=retry_after,
+                )
+            )
+        except URLError as exc:
+            should_retry = attempt < max_attempts
+            _LOGGER.warning(
+                "Pokemon API indisponivel em %s (tentativa %s/%s): %s%s",
+                url,
+                attempt,
+                max_attempts,
+                exc,
+                " - nova tentativa" if should_retry else "",
+            )
+
+            if not should_retry:
+                raise CardCatalogError("Pokemon card API indisponivel no momento") from exc
+
+            time.sleep(
+                _backoff_delay(
+                    attempt=attempt,
+                    base_delay_seconds=base_delay,
+                    max_delay_seconds=max_delay,
+                    retry_after_seconds=None,
+                )
+            )
+    else:
+        raise CardCatalogError("Pokemon card API indisponivel no momento")
 
     try:
         return json.loads(payload)
     except json.JSONDecodeError as exc:
+        _LOGGER.warning("Pokemon card API retornou JSON invalido para URL: %s", url)
         raise CardCatalogError("Pokemon card API retornou resposta invalida") from exc
 
 
@@ -313,6 +434,18 @@ def _coerce_int(value: Any) -> int | None:
     return None
 
 
+def _sanitize_for_wildcard(value: str) -> str:
+    without_quotes = value.replace('"', " ").replace("'", " ").replace("’", " ")
+    sanitized = re.sub(r"[^\w\s-]", " ", without_quotes, flags=re.UNICODE)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip()
+    return sanitized
+
+
+def _wildcard_pattern(value: str) -> str:
+    tokens = [token for token in _sanitize_for_wildcard(value).split(" ") if token]
+    return "*".join(tokens)
+
+
 def _query_candidates(raw_query: str) -> list[str]:
     normalized = raw_query.strip()
     local_and_total_match = re.fullmatch(r"(\d{1,4})\s*/\s*(\d{1,4})", normalized)
@@ -329,8 +462,20 @@ def _query_candidates(raw_query: str) -> list[str]:
         normalized_number = normalized.lstrip("0") or "0"
         return [f'(number:"{normalized}" OR number:"{normalized_number}")']
 
-    safe = normalized.replace('"', "")
-    return [f'name:*{safe}*', f'set.name:*{safe}*']
+    mixed_number_match = _NUMBER_TOTAL_PATTERN.search(normalized)
+    if mixed_number_match:
+        raw_local = mixed_number_match.group(1)
+        normalized_local = raw_local.lstrip("0") or "0"
+        total = mixed_number_match.group(2).lstrip("0") or "0"
+        return [
+            f'(number:"{raw_local}" OR number:"{normalized_local}") set.printedTotal:{total}',
+            f'(number:"{raw_local}" OR number:"{normalized_local}") set.total:{total}',
+        ]
+
+    wildcard = _wildcard_pattern(normalized)
+    if not wildcard:
+        return []
+    return [f'name:*{wildcard}*', f'set.name:*{wildcard}*']
 
 
 def search_cards(query: str, limit: int = 12) -> list[CardLookupItem]:
@@ -344,6 +489,7 @@ def search_cards(query: str, limit: int = 12) -> list[CardLookupItem]:
     )
 
     cards_data: list[dict[str, Any]] = []
+    last_error: CardCatalogError | None = None
     for candidate in _query_candidates(query_text):
         params = {
             "q": candidate,
@@ -352,11 +498,24 @@ def search_cards(query: str, limit: int = 12) -> list[CardLookupItem]:
             "select": select_fields,
         }
         url = f"{_base_url('/cards')}?{urlencode(params)}"
-        payload = _request_json(url)
+        try:
+            payload = _request_json(url)
+        except CardCatalogError as exc:
+            last_error = exc
+            _LOGGER.warning(
+                "Falha em candidato de busca Pokemon API (query=%s, candidate=%s): %s",
+                query_text,
+                candidate,
+                exc,
+            )
+            continue
         data = payload.get("data")
         if isinstance(data, list) and data:
             cards_data = [item for item in data if isinstance(item, dict)]
             break
+
+    if not cards_data and last_error is not None:
+        raise last_error
 
     fx_rates = _get_fx_rates_cached()
     results: list[CardLookupItem] = []

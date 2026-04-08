@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.schemas.store import (
     AnalyticsSummaryItem,
@@ -12,13 +12,12 @@ from app.schemas.store import (
     StoreProduct,
     StoreProductListResponse,
 )
-
-# from app.security.admin_auth import require_admin_token
+from app.security.admin_auth import require_admin_session
 from app.services.card_catalog import CardCatalogError, fetch_card_metadata_options, search_cards
 from app.services.firestore_admin import (
     FirestoreConnectionError,
     FirestoreQuotaExceeded,
-    analytics_summary_last_days,
+    analytics_summary_last_days_with_source,
     delete_product,
     fetch_products_from_firestore,
     upsert_product,
@@ -30,9 +29,7 @@ from app.services.lot_import import (
     start_lot_import,
 )
 
-# TEST MODE (TEMPORARIO): auth desabilitada para facilitar testes locais.
-# router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin_token)])
-router = APIRouter(prefix="/admin", tags=["admin"])
+router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin_session)])
 
 
 def _raise_firestore_http_error(exc: FirestoreConnectionError) -> None:
@@ -120,12 +117,12 @@ def get_lot_import_status(job_id: str) -> LotImportJobResponse:
 @router.get("/analytics/summary", response_model=AnalyticsSummaryResponse)
 def get_admin_analytics(days: int = Query(default=30, ge=1, le=365)) -> AnalyticsSummaryResponse:
     try:
-        summary = analytics_summary_last_days(days=days)
+        source, summary = analytics_summary_last_days_with_source(days=days)
     except FirestoreConnectionError as exc:
         _raise_firestore_http_error(exc)
 
     return AnalyticsSummaryResponse(
-        source="firestore",
+        source=source,
         period_days=days,
         items=[AnalyticsSummaryItem(endpoint=endpoint, count=count) for endpoint, count in summary],
     )

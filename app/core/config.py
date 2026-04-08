@@ -15,8 +15,26 @@ class Settings(BaseSettings):
         default=["http://localhost:5173"], alias="BACKEND_CORS_ORIGINS"
     )
     admin_api_token: str = Field(default="change-me-admin-token", alias="ADMIN_API_TOKEN")
+    admin_auth_email: str = Field(default="admin@legacycards.local", alias="ADMIN_AUTH_EMAIL")
+    admin_auth_password_hash: str = Field(default="", alias="ADMIN_AUTH_PASSWORD_HASH")
+    admin_auth_jwt_secret: str = Field(default="", alias="ADMIN_AUTH_JWT_SECRET")
+    admin_auth_jwt_algorithm: str = Field(default="HS256", alias="ADMIN_AUTH_JWT_ALGORITHM")
+    admin_auth_jwt_expires_minutes: int = Field(default=480, alias="ADMIN_AUTH_JWT_EXPIRES_MINUTES")
+    admin_auth_2fa_enabled: bool = Field(default=True, alias="ADMIN_AUTH_2FA_ENABLED")
+    admin_auth_totp_secret: str = Field(default="", alias="ADMIN_AUTH_TOTP_SECRET")
+    admin_auth_totp_issuer: str = Field(
+        default="Legacy Cards Admin", alias="ADMIN_AUTH_TOTP_ISSUER"
+    )
+    admin_auth_2fa_challenge_minutes: int = Field(
+        default=5, alias="ADMIN_AUTH_2FA_CHALLENGE_MINUTES"
+    )
+    admin_auth_max_failed_attempts: int = Field(default=5, alias="ADMIN_AUTH_MAX_FAILED_ATTEMPTS")
+    admin_auth_failed_window_seconds: int = Field(
+        default=900, alias="ADMIN_AUTH_FAILED_WINDOW_SECONDS"
+    )
     firestore_enabled: bool = Field(default=True, alias="FIRESTORE_ENABLED")
     firestore_project_id: str | None = Field(default=None, alias="FIRESTORE_PROJECT_ID")
+    firestore_database_id: str = Field(default="(default)", alias="FIRESTORE_DATABASE_ID")
     firestore_collection_products: str = Field(
         default="store_products", alias="FIRESTORE_COLLECTION_PRODUCTS"
     )
@@ -26,10 +44,37 @@ class Settings(BaseSettings):
     firestore_service_account_path: str = Field(
         default="service.json", alias="FIRESTORE_SERVICE_ACCOUNT_PATH"
     )
+    bigquery_enabled: bool = Field(default=False, alias="BIGQUERY_ENABLED")
+    bigquery_project_id: str | None = Field(default=None, alias="BIGQUERY_PROJECT_ID")
+    bigquery_dataset: str = Field(default="legacy_cards_analytics", alias="BIGQUERY_DATASET")
+    bigquery_events_table: str = Field(default="events", alias="BIGQUERY_EVENTS_TABLE")
+    bigquery_service_account_path: str = Field(
+        default="service.json", alias="BIGQUERY_SERVICE_ACCOUNT_PATH"
+    )
+    bigquery_location: str = Field(default="US", alias="BIGQUERY_LOCATION")
+    bigquery_auto_create_dataset: bool = Field(
+        default=True, alias="BIGQUERY_AUTO_CREATE_DATASET"
+    )
+    analytics_summary_fallback_firestore: bool = Field(
+        default=True, alias="ANALYTICS_SUMMARY_FALLBACK_FIRESTORE"
+    )
     pokemon_tcg_api_base_url: str = Field(
         default="https://api.pokemontcg.io/v2", alias="POKEMON_TCG_API_BASE_URL"
     )
     pokemon_tcg_api_key: str | None = Field(default=None, alias="POKEMON_TCG_API_KEY")
+    pokemon_tcg_timeout_seconds: float = Field(
+        default=20.0, alias="POKEMON_TCG_TIMEOUT_SECONDS"
+    )
+    pokemon_tcg_retry_attempts: int = Field(default=4, alias="POKEMON_TCG_RETRY_ATTEMPTS")
+    pokemon_tcg_retry_base_delay_seconds: float = Field(
+        default=0.6, alias="POKEMON_TCG_RETRY_BASE_DELAY_SECONDS"
+    )
+    pokemon_tcg_retry_max_delay_seconds: float = Field(
+        default=6.0, alias="POKEMON_TCG_RETRY_MAX_DELAY_SECONDS"
+    )
+    pokemon_tcg_min_interval_seconds: float = Field(
+        default=0.25, alias="POKEMON_TCG_MIN_INTERVAL_SECONDS"
+    )
     awesomeapi_fx_url: str = Field(
         default="https://economia.awesomeapi.com.br/json/last/USD-BRL,EUR-BRL",
         alias="AWESOMEAPI_FX_URL",

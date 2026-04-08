@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import re
 import threading
 from datetime import UTC, datetime
@@ -25,6 +26,7 @@ from app.services.firestore_admin import (
 
 _JOB_STORE: dict[str, dict[str, Any]] = {}
 _JOB_LOCK = threading.Lock()
+_LOGGER = logging.getLogger(__name__)
 
 _VALID_REGULATION_MARK = re.compile(r"^[A-I]$")
 
@@ -174,6 +176,7 @@ def _extract_lot_cards(
 def _identity_key(product: StoreProduct) -> str:
     return "|".join(
         [
+            _normalize_text(product.lot_id or ""),
             _normalize_text(product.name),
             _normalize_text(product.card_number or ""),
             _normalize_text(product.set_name or ""),
@@ -215,10 +218,18 @@ def _score_lookup_candidate(candidate: Any, wanted_name: str, wanted_number: str
 
     wanted_name_norm = _normalize_text(wanted_name)
     wanted_number_norm = _normalize_card_number(wanted_number)
+    wanted_total: int | None = None
+    if "/" in wanted_number_norm:
+        _, total_part = wanted_number_norm.split("/", 1)
+        if total_part.isdigit():
+            wanted_total = int(total_part)
 
     candidate_name_norm = _normalize_text(candidate.name)
     candidate_number_norm = _normalize_card_number(candidate.number)
     candidate_local_norm = _normalize_card_number(candidate.local_number or "")
+    candidate_printed_total = (
+        candidate.printed_total if isinstance(candidate.printed_total, int) else None
+    )
 
     if candidate_name_norm == wanted_name_norm:
         score += 4
@@ -236,15 +247,23 @@ def _score_lookup_candidate(candidate: Any, wanted_name: str, wanted_number: str
     ):
         score += 3
 
+    if wanted_total is not None:
+        if candidate_printed_total == wanted_total:
+            score += 4
+        elif candidate_printed_total is not None:
+            score -= 3
+
     if candidate.set_name:
         score += 1
     if candidate.image_large or candidate.image_small:
         score += 1
+    if candidate.suggested_price_brl and candidate.suggested_price_brl > 0:
+        score += 2
 
     return score
 
 
-def _lookup_best_card(name: str, number: str) -> Any | None:
+def _lookup_best_card(name: str, number: str) -> tuple[Any | None, bool]:
     queries: list[str] = []
     normalized_number = number.strip()
 
@@ -263,6 +282,7 @@ def _lookup_best_card(name: str, number: str) -> Any | None:
     seen_query: set[str] = set()
     best_candidate: Any | None = None
     best_score = -1
+    lookup_had_error = False
 
     for query in queries:
         if query in seen_query:
@@ -271,19 +291,35 @@ def _lookup_best_card(name: str, number: str) -> Any | None:
 
         try:
             items = search_cards(query=query, limit=8)
-        except CardCatalogError:
+        except CardCatalogError as exc:
+            lookup_had_error = True
+            _LOGGER.warning(
+                "Falha ao buscar metadados de carta na API (query=%s, name=%s, number=%s): %s",
+                query,
+                name,
+                number,
+                exc,
+            )
             continue
 
         for item in items:
             candidate_score = _score_lookup_candidate(item, name, number)
-            if candidate_score > best_score:
+            candidate_has_price = bool(item.suggested_price_brl and item.suggested_price_brl > 0)
+            best_has_price = bool(
+                best_candidate
+                and best_candidate.suggested_price_brl
+                and best_candidate.suggested_price_brl > 0
+            )
+            if candidate_score > best_score or (
+                candidate_score == best_score and candidate_has_price and not best_has_price
+            ):
                 best_score = candidate_score
                 best_candidate = item
 
         if best_score >= 10:
             break
 
-    return best_candidate
+    return best_candidate, lookup_had_error
 
 
 def _extract_json_object(raw_text: str) -> dict[str, Any] | None:
@@ -405,6 +441,7 @@ def _infer_regulation_marks_with_openai(items: list[dict[str, Any]]) -> dict[int
 def _build_product_payload(
     *,
     raw_card: dict[str, Any],
+    lot_id: str | None,
     metadata: Any | None,
     default_condition: str,
     default_finish: str,
@@ -430,10 +467,21 @@ def _build_product_payload(
     if metadata and metadata.image_small and metadata.image_small != image_url:
         image_gallery = [metadata.image_small]
 
-    price_brl = metadata.suggested_price_brl if metadata and metadata.suggested_price_brl else 0.0
+    price_brl = 0.0
+    if metadata and metadata.suggested_price_brl and metadata.suggested_price_brl > 0:
+        price_brl = float(metadata.suggested_price_brl)
+    elif (
+        metadata
+        and metadata.suggested_price_usd
+        and metadata.suggested_price_usd > 0
+        and metadata.usd_brl_rate
+        and metadata.usd_brl_rate > 0
+    ):
+        price_brl = round(float(metadata.suggested_price_usd) * float(metadata.usd_brl_rate), 2)
     slug_seed = "-".join(
         part
         for part in [
+            lot_id or "",
             name,
             set_code or "",
             card_number.replace("/", "-"),
@@ -448,6 +496,7 @@ def _build_product_payload(
         "slug": slug,
         "name": name,
         "product_type": "single_card",
+        "lot_id": lot_id,
         "set_name": set_name,
         "set_series": set_series,
         "rarity": rarity,
@@ -473,6 +522,28 @@ def _build_product_payload(
     return payload
 
 
+def _estimate_price_brl_by_rarity(rarity: str | None) -> float:
+    normalized = (rarity or "").strip().lower()
+
+    if any(
+        token in normalized
+        for token in ("secret", "hyper", "ultra", "special illustration", "sar", "ur", "sr")
+    ):
+        return 39.90
+    if any(token in normalized for token in ("illustration", "full art", "ace")):
+        return 24.90
+    if "holo" in normalized or "foil" in normalized:
+        return 9.90
+    if "rare" in normalized:
+        return 4.90
+    if "uncommon" in normalized:
+        return 2.49
+    if "common" in normalized:
+        return 1.49
+
+    return 2.99
+
+
 def _initialize_job(
     lot_id: str | None,
     lot_name: str | None,
@@ -491,6 +562,7 @@ def _initialize_job(
                 "status": "queued",
                 "action": None,
                 "message": None,
+                "lot_id": lot_id,
                 "slug": _slugify(f"{name}-{number.replace('/', '-')}-{language}"),
                 "name": name,
                 "card_number": number,
@@ -589,9 +661,16 @@ def _to_job_response(job: dict[str, Any]) -> LotImportJobResponse:
 
 def _run_import_job(
     job_id: str,
+    lot_id: str | None,
     cards: list[dict[str, Any]],
     request: LotImportStartRequest,
 ) -> None:
+    _LOGGER.info(
+        "Iniciando importacao de lote job_id=%s lot_id=%s total_cards=%s",
+        job_id,
+        lot_id or "-",
+        len(cards),
+    )
     _set_job_fields(job_id, status="running")
 
     try:
@@ -617,25 +696,68 @@ def _run_import_job(
             message="Buscando metadados",
         )
 
-        metadata = _lookup_best_card(
+        metadata, lookup_had_error = _lookup_best_card(
             name=str(raw_card.get("name") or "").strip(),
             number=str(raw_card.get("number") or "").strip(),
         )
 
+        entry_messages = ["Pronto para salvar"]
+        if metadata is None and lookup_had_error:
+            entry_messages = [
+                "Metadados limitados (API indisponivel/rate limit). Seguindo com dados basicos."
+            ]
+            _LOGGER.warning(
+                "Carta sem metadados por falha externa job_id=%s index=%s name=%s number=%s",
+                job_id,
+                idx,
+                str(raw_card.get("name") or "").strip(),
+                str(raw_card.get("number") or "").strip(),
+            )
+        elif metadata is None:
+            entry_messages = ["Carta nao encontrada na API. Seguindo com dados basicos."]
+            _LOGGER.info(
+                "Carta nao encontrada na API job_id=%s index=%s name=%s number=%s",
+                job_id,
+                idx,
+                str(raw_card.get("name") or "").strip(),
+                str(raw_card.get("number") or "").strip(),
+            )
+
         payload = _build_product_payload(
             raw_card=raw_card,
+            lot_id=lot_id,
             metadata=metadata,
             default_condition=request.default_condition,
             default_finish=request.default_finish,
             default_category=request.default_category,
         )
+
+        if float(payload.get("price_brl") or 0) <= 0:
+            fallback_price = _estimate_price_brl_by_rarity(payload.get("rarity"))
+            payload["price_brl"] = fallback_price
+            entry_messages.append(
+                f"Preco estimado por raridade: R$ {fallback_price:.2f} (sem cotacao na API)."
+            )
+            _LOGGER.warning(
+                (
+                    "Preco de mercado ausente na API; aplicando fallback "
+                    "job_id=%s index=%s name=%s number=%s price=%s"
+                ),
+                job_id,
+                idx,
+                payload.get("name"),
+                payload.get("card_number"),
+                fallback_price,
+            )
+
         prepared_payloads.append(payload)
 
         _set_entry_fields(
             job_id,
             idx,
             status="ready",
-            message="Pronto para salvar",
+            message=" | ".join(entry_messages),
+            lot_id=payload["lot_id"],
             slug=payload["slug"],
             category=payload["category"],
             condition=payload["condition"],
@@ -755,6 +877,15 @@ def _run_import_job(
         job["status"] = "completed_with_errors" if job["error_count"] > 0 else "completed"
         job["finished_at"] = _now_iso()
 
+        _LOGGER.info(
+            "Importacao concluida job_id=%s status=%s created=%s updated=%s errors=%s",
+            job_id,
+            job["status"],
+            job["created_count"],
+            job["updated_count"],
+            job["error_count"],
+        )
+
 
 def start_lot_import(request: LotImportStartRequest) -> LotImportStartResponse:
     settings = get_settings()
@@ -769,7 +900,7 @@ def start_lot_import(request: LotImportStartRequest) -> LotImportStartResponse:
 
     worker = threading.Thread(
         target=_run_import_job,
-        args=(job_id, cards, request),
+        args=(job_id, lot_id, cards, request),
         daemon=True,
         name=f"lot-import-{job_id[:8]}",
     )
