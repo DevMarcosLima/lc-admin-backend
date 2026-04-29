@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import threading
+import unicodedata
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -83,17 +84,31 @@ def _map_finish(details: str | None, default_finish: str) -> str:
     if not raw:
         return default_finish
 
+    # Normaliza acentos/sinais para suportar variacoes de OCR e digitacao.
+    normalized = unicodedata.normalize("NFKD", raw)
+    ascii_normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    compact = re.sub(r"[^a-z0-9]+", " ", ascii_normalized).strip()
+    tokens = compact.split()
+
+    def has(token: str) -> bool:
+        return token in tokens
+
+    def has_prefix(prefix: str) -> bool:
+        return any(token.startswith(prefix) for token in tokens)
+
     if "master" in raw and "ball" in raw:
         return "Master Ball Reverse Holo"
-    if ("poke" in raw or "pokeball" in raw) and "ball" in raw:
+    if has("pokeball") or (has("poke") and has("ball")):
         return "Poke Ball Reverse Holo"
-    if "reverse" in raw:
+    if has("reverse") and (has("element") or has_prefix("elem")):
+        return "Reverse Holo Element (Reverse Foil)"
+    if has("reverse"):
         return "Reverse Holo (Reverse Foil)"
-    if "mirror" in raw:
+    if has("mirror"):
         return "Mirror Foil"
-    if "full" in raw and "art" in raw:
+    if has("full") and has("art"):
         return "Full Art"
-    if "holo" in raw or "foil" in raw:
+    if has("holo") or has("foil"):
         return "Holo (Holofoil)"
 
     return default_finish
@@ -213,45 +228,91 @@ def _season_tags_from_payload(payload: dict[str, Any]) -> list[str]:
     return tags
 
 
-def _score_lookup_candidate(candidate: Any, wanted_name: str, wanted_number: str) -> int:
-    score = 0
+def _candidate_number_match_score(candidate: Any, wanted_number: str) -> int:
+    def _normalize_local_token(value: str) -> str:
+        return value.lstrip("0") or "0"
 
-    wanted_name_norm = _normalize_text(wanted_name)
     wanted_number_norm = _normalize_card_number(wanted_number)
+    if not wanted_number_norm:
+        return 0
+
+    wanted_local = _normalize_local_token(wanted_number_norm.split("/", 1)[0])
     wanted_total: int | None = None
     if "/" in wanted_number_norm:
         _, total_part = wanted_number_norm.split("/", 1)
         if total_part.isdigit():
             wanted_total = int(total_part)
 
-    candidate_name_norm = _normalize_text(candidate.name)
-    candidate_number_norm = _normalize_card_number(candidate.number)
-    candidate_local_norm = _normalize_card_number(candidate.local_number or "")
+    candidate_number_norm = _normalize_card_number(str(getattr(candidate, "number", "") or ""))
+    candidate_local_norm = _normalize_card_number(str(getattr(candidate, "local_number", "") or ""))
     candidate_printed_total = (
-        candidate.printed_total if isinstance(candidate.printed_total, int) else None
+        getattr(candidate, "printed_total", None)
+        if isinstance(getattr(candidate, "printed_total", None), int)
+        else None
     )
+
+    if wanted_number_norm and (
+        candidate_local_norm == wanted_number_norm or candidate_number_norm == wanted_number_norm
+    ):
+        return 4
+
+    candidate_local_only = ""
+    if candidate_local_norm:
+        candidate_local_only = _normalize_local_token(
+            candidate_local_norm.split("/", 1)[0]
+        )
+
+    candidate_number_only = ""
+    if candidate_number_norm:
+        candidate_number_only = _normalize_local_token(
+            candidate_number_norm.split("/", 1)[0]
+        )
+    local_match = wanted_local and (
+        candidate_local_only == wanted_local or candidate_number_only == wanted_local
+    )
+    if not local_match:
+        return 0
+
+    if wanted_total is None:
+        return 2
+
+    candidate_local_total: int | None = None
+    if "/" in candidate_local_norm:
+        _, candidate_total_part = candidate_local_norm.split("/", 1)
+        if candidate_total_part.isdigit():
+            candidate_local_total = int(candidate_total_part)
+
+    if candidate_printed_total == wanted_total or candidate_local_total == wanted_total:
+        return 3
+
+    return 1
+
+
+def _score_lookup_candidate(candidate: Any, wanted_name: str, wanted_number: str) -> int:
+    score = 0
+
+    wanted_name_norm = _normalize_text(wanted_name)
+    wanted_number_norm = _normalize_card_number(wanted_number)
+
+    candidate_name_norm = _normalize_text(candidate.name)
+    number_match = _candidate_number_match_score(candidate, wanted_number)
 
     if candidate_name_norm == wanted_name_norm:
         score += 4
     elif wanted_name_norm and wanted_name_norm in candidate_name_norm:
         score += 2
 
-    if wanted_number_norm and candidate_local_norm == wanted_number_norm:
-        score += 6
-    elif wanted_number_norm and candidate_number_norm == wanted_number_norm:
-        score += 5
-    elif (
-        wanted_number_norm
-        and candidate_number_norm
-        and wanted_number_norm.split("/")[0] == candidate_number_norm
-    ):
-        score += 3
-
-    if wanted_total is not None:
-        if candidate_printed_total == wanted_total:
-            score += 4
-        elif candidate_printed_total is not None:
-            score -= 3
+    if wanted_number_norm:
+        if number_match == 4:
+            score += 30
+        elif number_match == 3:
+            score += 24
+        elif number_match == 2:
+            score += 16
+        elif number_match == 1:
+            score += 10
+        else:
+            score -= 18
 
     if candidate.set_name:
         score += 1
@@ -318,6 +379,10 @@ def _lookup_best_card(name: str, number: str) -> tuple[Any | None, bool]:
 
         if best_score >= 10:
             break
+
+    if normalized_number and best_candidate is not None:
+        if _candidate_number_match_score(best_candidate, normalized_number) == 0:
+            return None, lookup_had_error
 
     return best_candidate, lookup_had_error
 
@@ -447,10 +512,19 @@ def _build_product_payload(
     default_finish: str,
     default_category: str,
 ) -> dict[str, Any]:
-    name = str(raw_card.get("name") or "").strip()
+    raw_name = str(raw_card.get("name") or "").strip()
     card_number = str(raw_card.get("number") or "").strip()
     quantity = _safe_positive_int(raw_card.get("quantity"), fallback=1)
     language = str(raw_card.get("language") or "PT").strip().upper() or "PT"
+
+    metadata_name = str(getattr(metadata, "name", "") or "").strip() if metadata else ""
+    metadata_number_match = (
+        _candidate_number_match_score(metadata, card_number) if metadata else 0
+    )
+    if metadata_name and card_number and metadata_number_match > 0:
+        name = metadata_name
+    else:
+        name = raw_name or metadata_name
 
     category = _map_category(str(raw_card.get("category") or "").strip(), default_category)
     finish = _map_finish(str(raw_card.get("details") or "").strip(), default_finish)
@@ -461,6 +535,7 @@ def _build_product_payload(
     rarity = metadata.rarity if metadata else None
     release_year = metadata.release_year if metadata else None
     generation = metadata.pokemon_generation if metadata else None
+    pokemon_types = metadata.pokemon_types if metadata else []
     regulation_mark = metadata.regulation_mark if metadata else None
     image_url = (metadata.image_large or metadata.image_small) if metadata else None
     image_gallery: list[str] = []
@@ -508,6 +583,9 @@ def _build_product_payload(
         "language": language,
         "release_year": release_year,
         "pokemon_generation": generation,
+        "pokemon_types": pokemon_types or [],
+        "description": None,
+        "observations": None,
         "category": category,
         "season_tags": [],
         "accessory_kind": None,
@@ -577,6 +655,7 @@ def _initialize_job(
                 "regulation_mark": None,
                 "release_year": None,
                 "pokemon_generation": None,
+                "pokemon_types": [],
                 "image_url": None,
                 "price_brl": 0.0,
             }
@@ -731,6 +810,14 @@ def _run_import_job(
             default_finish=request.default_finish,
             default_category=request.default_category,
         )
+        original_name = str(raw_card.get("name") or "").strip()
+        resolved_name = str(payload.get("name") or "").strip()
+        if (
+            resolved_name
+            and original_name
+            and _normalize_text(resolved_name) != _normalize_text(original_name)
+        ):
+            entry_messages.append(f"Nome corrigido pelo numero: {resolved_name}.")
 
         if float(payload.get("price_brl") or 0) <= 0:
             fallback_price = _estimate_price_brl_by_rarity(payload.get("rarity"))
@@ -768,6 +855,7 @@ def _run_import_job(
             regulation_mark=payload["regulation_mark"],
             release_year=payload["release_year"],
             pokemon_generation=payload["pokemon_generation"],
+            pokemon_types=payload["pokemon_types"],
             image_url=payload["image_url"],
             price_brl=payload["price_brl"],
         )

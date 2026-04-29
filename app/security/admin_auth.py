@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-import base64
-import hashlib
 import hmac
-import secrets
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 import jwt
 import pyotp
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.core.config import get_settings
+from app.security.password_utils import hash_password, verify_password
 
 bearer_scheme = HTTPBearer(auto_error=False)
 bearer_dependency = Depends(bearer_scheme)
@@ -22,8 +21,12 @@ bearer_dependency = Depends(bearer_scheme)
 @dataclass(slots=True)
 class AdminSession:
     email: str
+    role: Literal["admin", "seller"]
     issued_at: datetime
     expires_at: datetime
+    shop_name: str | None = None
+    shop_slug: str | None = None
+    must_change_password: bool = False
 
 
 class LoginRateLimiter:
@@ -76,45 +79,34 @@ class LoginRateLimiter:
 login_rate_limiter = LoginRateLimiter()
 
 
-def _b64_encode(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).decode("utf-8").rstrip("=")
-
-
-def _b64_decode(value: str) -> bytes:
-    padded = value + "=" * ((4 - len(value) % 4) % 4)
-    return base64.urlsafe_b64decode(padded.encode("utf-8"))
-
-
 def hash_admin_password(password: str, *, iterations: int = 390000) -> str:
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-    return f"pbkdf2_sha256${iterations}${_b64_encode(salt)}${_b64_encode(digest)}"
+    return hash_password(password, iterations=iterations)
 
 
 def verify_admin_password(password: str, stored_hash: str) -> bool:
-    try:
-        scheme, iteration_text, salt_text, hash_text = stored_hash.split("$", maxsplit=3)
-        if scheme != "pbkdf2_sha256":
-            return False
-        iterations = int(iteration_text)
-        salt = _b64_decode(salt_text)
-        expected = _b64_decode(hash_text)
-    except (TypeError, ValueError):
-        return False
-
-    computed = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-    return hmac.compare_digest(computed, expected)
+    return verify_password(password, stored_hash)
 
 
-def _require_auth_config() -> None:
+def _require_jwt_config() -> None:
+    settings = get_settings()
+    if not settings.admin_auth_jwt_secret.strip():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Configuracao de autenticacao incompleta: ADMIN_AUTH_JWT_SECRET",
+        )
+
+
+def _require_admin_login_config() -> None:
     settings = get_settings()
     missing: list[str] = []
+    if not settings.admin_auth_email.strip():
+        missing.append("ADMIN_AUTH_EMAIL")
     if not settings.admin_auth_password_hash.strip():
         missing.append("ADMIN_AUTH_PASSWORD_HASH")
-    if not settings.admin_auth_jwt_secret.strip():
-        missing.append("ADMIN_AUTH_JWT_SECRET")
     if settings.admin_auth_2fa_enabled and not settings.admin_auth_totp_secret.strip():
         missing.append("ADMIN_AUTH_TOTP_SECRET")
+    if not settings.admin_auth_jwt_secret.strip():
+        missing.append("ADMIN_AUTH_JWT_SECRET")
 
     if missing:
         raise HTTPException(
@@ -154,12 +146,25 @@ def verify_totp_code(*, code: str) -> bool:
     return bool(totp.verify(otp, valid_window=1))
 
 
-def _encode_token(*, subject: str, purpose: str, expires_minutes: int) -> str:
+def _encode_token(
+    *,
+    subject: str,
+    purpose: str,
+    role: Literal["admin", "seller"],
+    expires_minutes: int,
+    shop_name: str | None = None,
+    shop_slug: str | None = None,
+    must_change_password: bool = False,
+) -> str:
     settings = get_settings()
     now = datetime.now(UTC)
     payload = {
         "sub": subject.strip().lower(),
         "purpose": purpose,
+        "role": role,
+        "shop_name": (shop_name or "").strip() or None,
+        "shop_slug": (shop_slug or "").strip() or None,
+        "must_change_password": bool(must_change_password),
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=expires_minutes)).timestamp()),
         "iss": settings.admin_auth_totp_issuer,
@@ -178,7 +183,7 @@ def _decode_token(*, token: str, expected_purpose: str) -> dict:
             token,
             settings.admin_auth_jwt_secret,
             algorithms=[settings.admin_auth_jwt_algorithm],
-            options={"require": ["exp", "iat", "sub", "purpose"]},
+            options={"require": ["exp", "iat", "sub", "purpose", "role"]},
         )
     except jwt.InvalidTokenError as exc:
         raise HTTPException(
@@ -195,52 +200,164 @@ def _decode_token(*, token: str, expected_purpose: str) -> dict:
     return payload
 
 
-def create_access_token(*, email: str) -> tuple[str, int]:
-    _require_auth_config()
+def create_access_token(
+    *,
+    email: str,
+    role: Literal["admin", "seller"],
+    shop_name: str | None = None,
+    shop_slug: str | None = None,
+    must_change_password: bool = False,
+) -> tuple[str, int]:
+    _require_jwt_config()
     settings = get_settings()
-    ttl_minutes = max(settings.admin_auth_jwt_expires_minutes, 1)
-    token = _encode_token(subject=email, purpose="admin_access", expires_minutes=ttl_minutes)
+    ttl_minutes = max(settings.admin_auth_jwt_expires_minutes, 60)
+    token = _encode_token(
+        subject=email,
+        role=role,
+        purpose="panel_access",
+        expires_minutes=ttl_minutes,
+        shop_name=shop_name,
+        shop_slug=shop_slug,
+        must_change_password=must_change_password,
+    )
     return token, ttl_minutes * 60
 
 
-def create_2fa_challenge_token(*, email: str) -> tuple[str, int]:
-    _require_auth_config()
+def create_2fa_challenge_token(
+    *,
+    email: str,
+    role: Literal["admin", "seller"],
+    shop_name: str | None = None,
+    shop_slug: str | None = None,
+) -> tuple[str, int]:
+    _require_jwt_config()
     settings = get_settings()
     ttl_minutes = max(settings.admin_auth_2fa_challenge_minutes, 1)
     token = _encode_token(
         subject=email,
-        purpose="admin_2fa_challenge",
+        role=role,
+        purpose="panel_2fa_challenge",
         expires_minutes=ttl_minutes,
+        shop_name=shop_name,
+        shop_slug=shop_slug,
+    )
+    return token, ttl_minutes * 60
+
+
+def create_seller_onboarding_challenge_token(
+    *,
+    email: str,
+    shop_name: str | None,
+    shop_slug: str | None,
+) -> tuple[str, int]:
+    _require_jwt_config()
+    settings = get_settings()
+    ttl_minutes = max(settings.admin_auth_2fa_challenge_minutes * 3, 10)
+    token = _encode_token(
+        subject=email,
+        role="seller",
+        purpose="seller_onboarding_challenge",
+        expires_minutes=ttl_minutes,
+        shop_name=shop_name,
+        shop_slug=shop_slug,
+        must_change_password=True,
     )
     return token, ttl_minutes * 60
 
 
 def decode_2fa_challenge(*, token: str) -> dict:
-    return _decode_token(token=token, expected_purpose="admin_2fa_challenge")
+    return _decode_token(token=token, expected_purpose="panel_2fa_challenge")
+
+
+def decode_seller_onboarding_challenge(*, token: str) -> dict:
+    return _decode_token(token=token, expected_purpose="seller_onboarding_challenge")
 
 
 def decode_access_token(*, token: str) -> dict:
-    return _decode_token(token=token, expected_purpose="admin_access")
+    return _decode_token(token=token, expected_purpose="panel_access")
 
 
-def require_admin_session(
+def require_panel_session(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = bearer_dependency,
 ) -> AdminSession:
-    _require_auth_config()
+    _require_jwt_config()
 
-    if credentials is None or not credentials.credentials.strip():
+    settings = get_settings()
+    token = ""
+    if credentials is not None and credentials.credentials.strip():
+        token = credentials.credentials.strip()
+    else:
+        token = (request.cookies.get(settings.admin_auth_cookie_name) or "").strip()
+
+    if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token ausente.")
 
-    payload = decode_access_token(token=credentials.credentials.strip())
+    payload = decode_access_token(token=token)
+    role = str(payload.get("role") or "").strip().lower()
+    if role not in {"admin", "seller"}:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Role de token invalida.",
+        )
+    role_value: Literal["admin", "seller"] = "admin" if role == "admin" else "seller"
+
     email = str(payload.get("sub", "")).strip().lower()
     iat = datetime.fromtimestamp(int(payload["iat"]), tz=UTC)
     exp = datetime.fromtimestamp(int(payload["exp"]), tz=UTC)
-    return AdminSession(email=email, issued_at=iat, expires_at=exp)
+    return AdminSession(
+        email=email,
+        role=role_value,
+        shop_name=(str(payload.get("shop_name") or "").strip() or None),
+        shop_slug=(str(payload.get("shop_slug") or "").strip() or None),
+        must_change_password=bool(payload.get("must_change_password", False)),
+        issued_at=iat,
+        expires_at=exp,
+    )
+
+
+panel_session_dependency = Depends(require_panel_session)
+
+
+def require_admin_session(session: AdminSession = panel_session_dependency) -> AdminSession:
+    _require_admin_login_config()
+    if session.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acesso restrito ao admin.",
+        )
+    return session
+
+
+def require_seller_session(session: AdminSession = panel_session_dependency) -> AdminSession:
+    _require_jwt_config()
+    if session.role != "seller":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acesso restrito ao seller.",
+        )
+    try:
+        from app.services.seller_accounts import SellerAccountError, get_seller_account
+
+        seller = get_seller_account(session.email)
+    except SellerAccountError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+
+    if seller is None or seller.status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Conta seller inativa. Acesso temporariamente bloqueado.",
+        )
+
+    return session
 
 
 def get_totp_setup_uri() -> str:
     settings = get_settings()
-    _require_auth_config()
+    _require_admin_login_config()
     return pyotp.TOTP(settings.admin_auth_totp_secret).provisioning_uri(
         name=settings.admin_auth_email,
         issuer_name=settings.admin_auth_totp_issuer,

@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     admin_auth_jwt_secret: str = Field(default="", alias="ADMIN_AUTH_JWT_SECRET")
     admin_auth_jwt_algorithm: str = Field(default="HS256", alias="ADMIN_AUTH_JWT_ALGORITHM")
     admin_auth_jwt_expires_minutes: int = Field(default=480, alias="ADMIN_AUTH_JWT_EXPIRES_MINUTES")
+    admin_auth_cookie_name: str = Field(
+        default="lc_admin_session", alias="ADMIN_AUTH_COOKIE_NAME"
+    )
+    admin_auth_cookie_secure: bool = Field(default=True, alias="ADMIN_AUTH_COOKIE_SECURE")
+    admin_auth_cookie_samesite: str = Field(default="lax", alias="ADMIN_AUTH_COOKIE_SAMESITE")
     admin_auth_2fa_enabled: bool = Field(default=True, alias="ADMIN_AUTH_2FA_ENABLED")
     admin_auth_totp_secret: str = Field(default="", alias="ADMIN_AUTH_TOTP_SECRET")
     admin_auth_totp_issuer: str = Field(
@@ -41,9 +46,34 @@ class Settings(BaseSettings):
     firestore_collection_analytics: str = Field(
         default="analytics_events", alias="FIRESTORE_COLLECTION_ANALYTICS"
     )
+    firestore_collection_orders: str = Field(
+        default="orders", alias="FIRESTORE_COLLECTION_ORDERS"
+    )
+    firestore_collection_webhook_events: str = Field(
+        default="checkout_webhook_events",
+        alias="FIRESTORE_COLLECTION_WEBHOOK_EVENTS",
+    )
+    firestore_collection_seller_users: str = Field(
+        default="admin_seller_users", alias="FIRESTORE_COLLECTION_SELLER_USERS"
+    )
+    firestore_collection_panel_settings: str = Field(
+        default="admin_panel_settings",
+        alias="FIRESTORE_COLLECTION_PANEL_SETTINGS",
+    )
     firestore_service_account_path: str = Field(
         default="service.json", alias="FIRESTORE_SERVICE_ACCOUNT_PATH"
     )
+    asset_storage_bucket: str | None = Field(default=None, alias="ASSET_STORAGE_BUCKET")
+    firebase_storage_bucket: str | None = Field(default=None, alias="FIREBASE_STORAGE_BUCKET")
+    asset_storage_public_base_url: str | None = Field(
+        default=None, alias="ASSET_STORAGE_PUBLIC_BASE_URL"
+    )
+    asset_storage_path_prefix: str = Field(default="catalog", alias="ASSET_STORAGE_PATH_PREFIX")
+    asset_storage_max_image_bytes: int = Field(
+        default=12 * 1024 * 1024, alias="ASSET_STORAGE_MAX_IMAGE_BYTES"
+    )
+    legacy_store_name: str = Field(default="Legacy Cards", alias="LEGACY_STORE_NAME")
+    legacy_store_slug: str = Field(default="legacy-cards", alias="LEGACY_STORE_SLUG")
     bigquery_enabled: bool = Field(default=False, alias="BIGQUERY_ENABLED")
     bigquery_project_id: str | None = Field(default=None, alias="BIGQUERY_PROJECT_ID")
     bigquery_dataset: str = Field(default="legacy_cards_analytics", alias="BIGQUERY_DATASET")
@@ -92,6 +122,25 @@ class Settings(BaseSettings):
     )
     openai_regulation_batch_size: int = Field(
         default=40, alias="OPENAI_REGULATION_BATCH_SIZE"
+    )
+    openai_catalog_assistant_model: str = Field(
+        default="gpt-5-nano", alias="OPENAI_CATALOG_ASSISTANT_MODEL"
+    )
+    openai_catalog_max_products: int = Field(
+        default=250, alias="OPENAI_CATALOG_MAX_PRODUCTS"
+    )
+    openai_catalog_max_findings: int = Field(
+        default=50, alias="OPENAI_CATALOG_MAX_FINDINGS"
+    )
+    mercadopago_access_token: str | None = Field(
+        default=None, alias="MERCADOPAGO_ACCESS_TOKEN"
+    )
+    mercadopago_api_base_url: str = Field(
+        default="https://api.mercadopago.com",
+        alias="MERCADOPAGO_API_BASE_URL",
+    )
+    mercadopago_timeout_seconds: float = Field(
+        default=20.0, alias="MERCADOPAGO_TIMEOUT_SECONDS"
     )
     lot_import_max_cards: int = Field(default=500, alias="LOT_IMPORT_MAX_CARDS")
 

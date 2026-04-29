@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from app.core.config import get_settings
@@ -46,6 +46,7 @@ DEFAULT_FINISH_OPTIONS = [
     "Normal",
     "Holo (Holofoil)",
     "Reverse Holo (Reverse Foil)",
+    "Reverse Holo Element (Reverse Foil)",
     "Poke Ball Reverse Holo",
     "Master Ball Reverse Holo",
     "Mirror Foil",
@@ -99,11 +100,31 @@ _TCGPLAYER_PRICE_TYPE_PRIORITY = [
 _TCGPLAYER_METRIC_PRIORITY = ["market", "mid", "low", "high", "directLow"]
 _CARDMARKET_METRIC_PRIORITY = ["suggestedPrice", "trendPrice", "averageSellPrice", "avg7", "avg30"]
 _NUMBER_TOTAL_PATTERN = re.compile(r"(\d{1,4})\s*/\s*(\d{1,4})")
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 def _base_url(path: str) -> str:
     settings = get_settings()
     return f"{settings.pokemon_tcg_api_base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def _assert_safe_external_url(
+    url: str,
+    *,
+    allow_http_localhost: bool = False,
+) -> str:
+    candidate = str(url or "").strip()
+    parsed = urlsplit(candidate)
+    hostname = (parsed.hostname or "").strip("[]").lower()
+    scheme = parsed.scheme.lower()
+
+    if scheme == "https" and hostname:
+        return candidate
+
+    if allow_http_localhost and scheme == "http" and hostname in _LOCAL_HOSTS:
+        return candidate
+
+    raise CardCatalogError("URL externa insegura para consulta de catálogo.")
 
 
 def _parse_retry_after_seconds(raw_value: str | None) -> float | None:
@@ -169,14 +190,15 @@ def _request_json(url: str) -> dict[str, Any]:
     max_delay = max(base_delay, float(settings.pokemon_tcg_retry_max_delay_seconds))
     min_interval = max(0.0, float(settings.pokemon_tcg_min_interval_seconds))
 
-    request = Request(url=url, headers=headers)
+    safe_url = _assert_safe_external_url(url, allow_http_localhost=True)
+    request = Request(url=safe_url, headers=headers)
     payload = ""
 
     for attempt in range(1, max_attempts + 1):
         _wait_for_pokemon_tcg_slot(min_interval)
 
         try:
-            with urlopen(request, timeout=timeout_seconds) as response:
+            with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310
                 payload = response.read().decode("utf-8")
             break
         except HTTPError as exc:
@@ -303,11 +325,12 @@ def _fetch_fx_rates() -> dict[str, float]:
     if settings.awesomeapi_fx_key:
         headers["X-API-KEY"] = settings.awesomeapi_fx_key
 
-    request = Request(url=settings.awesomeapi_fx_url, headers=headers)
+    fx_url = _assert_safe_external_url(settings.awesomeapi_fx_url, allow_http_localhost=True)
+    request = Request(url=fx_url, headers=headers)
     timeout = max(1.0, float(settings.awesomeapi_fx_timeout_seconds))
 
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with urlopen(request, timeout=timeout) as response:  # nosec B310
             payload_raw = response.read().decode("utf-8")
     except (HTTPError, URLError):
         return {}
@@ -413,6 +436,24 @@ def _infer_generation(national_dex_numbers: Any) -> str | None:
     return None
 
 
+def _extract_pokemon_types(raw_types: Any) -> list[str]:
+    if not isinstance(raw_types, list):
+        return []
+
+    values: list[str] = []
+    seen: set[str] = set()
+    for raw_type in raw_types:
+        label = str(raw_type or "").strip()
+        if not label:
+            continue
+        lowered = label.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        values.append(label)
+    return values
+
+
 def _normalize_number_with_total(number: str, printed_total: int | None) -> str | None:
     normalized = number.strip()
     if not normalized:
@@ -485,7 +526,7 @@ def search_cards(query: str, limit: int = 12) -> list[CardLookupItem]:
 
     safe_limit = max(1, min(limit, 50))
     select_fields = (
-        "id,name,number,rarity,regulationMark,images,set,nationalPokedexNumbers,tcgplayer,cardmarket"
+        "id,name,number,rarity,regulationMark,images,set,nationalPokedexNumbers,types,tcgplayer,cardmarket"
     )
 
     cards_data: list[dict[str, Any]] = []
@@ -565,6 +606,7 @@ def search_cards(query: str, limit: int = 12) -> list[CardLookupItem]:
                 suggested_finish=suggested_finish,
                 usd_brl_rate=usd_brl_rate,
                 pokemon_generation=_infer_generation(card_payload.get("nationalPokedexNumbers")),
+                pokemon_types=_extract_pokemon_types(card_payload.get("types")),
             )
         )
 

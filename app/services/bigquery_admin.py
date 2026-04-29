@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+import re
 from typing import Any
 
 from app.core.config import get_settings
@@ -9,6 +10,9 @@ from app.core.config import get_settings
 
 class BigQueryConnectionError(RuntimeError):
     pass
+
+
+_BQ_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 
 
 def _resolve_service_account_path() -> Path:
@@ -60,7 +64,13 @@ def _table_id() -> str:
     project_id = settings.bigquery_project_id or get_bigquery_client().project
     if not project_id:
         raise BigQueryConnectionError("BIGQUERY_PROJECT_ID is not configured.")
-    return f"{project_id}.{settings.bigquery_dataset}.{settings.bigquery_events_table}"
+    dataset = str(settings.bigquery_dataset or "").strip()
+    table = str(settings.bigquery_events_table or "").strip()
+    if not _BQ_IDENTIFIER_PATTERN.fullmatch(dataset):
+        raise BigQueryConnectionError("BIGQUERY_DATASET inválido para consulta segura.")
+    if not _BQ_IDENTIFIER_PATTERN.fullmatch(table):
+        raise BigQueryConnectionError("BIGQUERY_EVENTS_TABLE inválido para consulta segura.")
+    return f"{project_id}.{dataset}.{table}"
 
 
 def analytics_summary_last_days(days: int = 30) -> list[tuple[str, int]]:
@@ -76,15 +86,17 @@ def analytics_summary_last_days(days: int = 30) -> list[tuple[str, int]]:
     except ModuleNotFoundError as exc:
         raise BigQueryConnectionError("google-cloud-bigquery is not installed") from exc
 
-    query = f"""
-        SELECT
-          COALESCE(NULLIF(endpoint, ''), 'unknown') AS endpoint,
-          COUNT(1) AS total
-        FROM `{table_name}`
-        WHERE event_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
-        GROUP BY endpoint
-        ORDER BY total DESC
-    """
+    query = "\n".join(
+        [
+            "SELECT",
+            "  COALESCE(NULLIF(endpoint, ''), 'unknown') AS endpoint,",
+            "  COUNT(1) AS total",
+            f"FROM `{table_name}`",
+            "WHERE event_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)",
+            "GROUP BY endpoint",
+            "ORDER BY total DESC",
+        ]
+    )
 
     try:
         client = get_bigquery_client()
