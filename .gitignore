@@ -7,3 +7,19 @@ __pycache__/
 service.json
 *.egg-info/
 AGENTS.md
+# Firebase / Firestore local configs
+.firebaserc
+firebase.json
+.firebase/
+firestore.*.rules
+firestore.*.indexes.json
+
+# Sensitive/local docs and credentials
+Documents/
+*.service-account.json
+service.json
+.env.local
+.env.*.local
+*.pem
+*.p12
+*.key
